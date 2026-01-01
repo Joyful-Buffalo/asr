@@ -343,7 +343,12 @@ class Conformer(torch.nn.Module):
             ]
         )
 
-    def forward(self, input: torch.Tensor, lengths: torch.Tensor, max_length) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        input: torch.Tensor,
+        lengths: torch.Tensor,
+        max_length: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""
         Args:
             input (torch.Tensor): with shape `(B, T, input_dim)`.
@@ -358,7 +363,9 @@ class Conformer(torch.nn.Module):
                     output lengths, with shape `(B,)` and i-th element representing
                     number of valid frames for i-th batch element in output frames.
         """
-        encoder_padding_mask = _lengths_to_padding_mask(lengths,max_length)
+        if max_length is None:
+            max_length = input.size(1)
+        encoder_padding_mask = _lengths_to_padding_mask(lengths, max_length)
 
         x = input.transpose(0, 1)
         for layer in self.conformer_layers:
