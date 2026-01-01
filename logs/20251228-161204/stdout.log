@@ -1,0 +1,939 @@
+===== SCRIPT SNAPSHOT BEGIN =====
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import atexit
+import json
+import math
+import random
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
+
+import numpy as np
+import torch
+import torchaudio
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torchaudio.compliance import kaldi
+from tqdm import tqdm
+
+from utils.specAug import SpecAugment
+
+
+@dataclass
+class ASRConfig:
+    train_manifest: str
+    dev_manifest: str
+    cmvn_path: str = "dataset/cmvn.npy"
+    sample_rate: int = 16000
+    num_mel_bins: int = 80
+    frame_length_ms: float = 25.0
+    frame_shift_ms: float = 10.0
+    dither: float = 0.0
+
+    # ===== [MOD] 贴近 WeNet/常见 Conformer Base 形状 =====
+    encoder_dim: int = 256          # d_model
+    ffn_dim: int = 2048             # FFN hidden dim（你之前误当 hidden_size 用了）
+    num_heads: int = 4              # 256/4=64
+    layers: int = 12                # 2 层太薄了，先上 12（显存紧张再降到 6）
+
+    dropout: float = 0.1
+
+    batch_size: Optional[int] = None
+    max_frames_per_batch: Optional[int] = 8192
+    num_epochs: int = 100
+    learning_rate: float = 5e-4     # WeNet 常见量级
+    weight_decay: float = 1e-5
+    max_grad_norm: float = 5.0
+
+    num_workers: int = 4
+    prefetch_factor: int = 2
+    bucket_size: int = 100
+    pin_memory: bool = True
+    shuffle: bool = True
+    persistent_workers: bool = True
+
+    # ===== [MOD] dev 不要 CPU 重计算：抽样算 CER =====
+    eval_max_batches: Optional[int] = None       # 只想更快就设 200/300
+    eval_cer_max_batches: int = 50               # 只用前 50 个 batch 算 CER（够看趋势）
+    train_cer_log_interval: int = 200            # 训练中每 N step 抽样打印 CER
+
+    # ===== [MOD] SpecAug 放到 main 里实例化，避免全局变量 =====
+    use_specaug_prob: float = 0.1
+
+    # ===== [MOD] WarmupLR（WeNet 常配 warmuplr / warmup_steps 例如 12000）=====
+    warmup_steps: int = 12000
+
+
+# ======================
+# 动态 batch 采样器
+# ======================
+class LengthBucketBatchSampler(Sampler[List[int]]):
+    def __init__(
+        self,
+        lengths: List[int],
+        batch_size: Optional[int] = None,
+        max_frames_per_batch: Optional[int] = None,
+        shuffle: bool = True,
+        bucket_size: int = 100,
+    ):
+        super().__init__(None)
+        assert (batch_size is None) ^ (max_frames_per_batch is None), \
+            "Exactly one of batch_size or max_frames_per_batch should be provided."
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.max_frames_per_batch = max_frames_per_batch
+        self.shuffle = shuffle
+        self.bucket_size = bucket_size
+        self._indices = list(range(len(lengths)))
+        self.g = torch.Generator().manual_seed(torch.seed())
+
+    def __iter__(self) -> Iterator[List[int]]:
+        if self.shuffle:
+            indices = [self._indices[i] for i in torch.randperm(len(self._indices), generator=self.g).tolist()]
+        else:
+            indices = self._indices
+
+        buckets = [indices[i:i + self.bucket_size] for i in range(0, len(indices), self.bucket_size)]
+        for b in buckets:
+            b.sort(key=lambda i: self.lengths[i])
+
+        flat = [i for b in buckets for i in b]
+
+        if self.batch_size is not None:
+            for i in range(0, len(flat), self.batch_size):
+                yield flat[i:i + self.batch_size]
+        else:
+            current: List[int] = []
+            cur_frames = 0
+            max_frames = cast(int, self.max_frames_per_batch)
+            for i in flat:
+                length = int(self.lengths[i])
+                if len(current) > 0 and (cur_frames + length) > max_frames:
+                    yield current
+                    current, cur_frames = [], 0
+                current.append(i)
+                cur_frames += length
+            if len(current) > 0:
+                yield current
+
+    def __len__(self) -> int:
+        if self.batch_size is not None:
+            return math.ceil(len(self.lengths) / self.batch_size)
+        avg = (sum(self.lengths) / max(1, len(self.lengths)))
+        return max(1, int(sum(self.lengths) / max(cast(int, self.max_frames_per_batch), cast(int, avg))))
+
+
+# ======================
+# 字级 tokenizer（0 留给 CTC blank）
+# ======================
+class CharTokenizer:
+    def __init__(self, char2id: Dict[str, int]) -> None:
+        self.blank_id: int = 0
+        self.char2id: Dict[str, int] = char2id
+        self.id2char: List[str] = ["<blank>"] + [ch for ch, _ in sorted(char2id.items(), key=lambda x: x[1])]
+
+    @classmethod
+    def build_from_jsonl(cls, manifest_path: str) -> "CharTokenizer":
+        chars: set[str] = set()
+        path = Path(manifest_path)
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                txt = item.get("txt") or item.get("text")
+                if txt is None:
+                    raise ValueError("每行 json 需要包含 'txt' 或 'text' 字段")
+                for ch in txt:
+                    if ch.isspace():
+                        continue
+                    chars.add(ch)
+        char2id: Dict[str, int] = {}
+        next_id = 1
+        for ch in sorted(chars):
+            char2id[ch] = next_id
+            next_id += 1
+        return cls(char2id)
+
+    @property
+    def vocab_size(self) -> int:
+        return 1 + len(self.char2id)
+
+    def encode(self, text: str) -> List[int]:
+        ids: List[int] = []
+        for ch in text:
+            if ch.isspace():
+                continue
+            idx = self.char2id.get(ch)
+            if idx is None:
+                continue
+            ids.append(idx)
+        return ids
+
+    def decode_ids(self, ids: List[int]) -> str:
+        chars: List[str] = []
+        for idx in ids:
+            if idx == self.blank_id:
+                continue
+            if 0 <= idx < len(self.id2char):
+                ch = self.id2char[idx]
+                if ch not in ("<blank>", "<unk>"):
+                    chars.append(ch)
+        return "".join(chars)
+
+
+class JsonlASRDataset(Dataset):
+    def __init__(
+        self,
+        manifest_path: str,
+        tokenizer: CharTokenizer,
+        config: ASRConfig,
+        compute_lengths: bool = False,
+        use_precomputed_fbank: bool = False
+    ) -> None:
+        super().__init__()
+        self.manifest_path = Path(manifest_path)
+        self.tokenizer = tokenizer
+        self.sample_rate = config.sample_rate
+        self.num_mel_bins = config.num_mel_bins
+        self.frame_length_ms = config.frame_length_ms
+        self.frame_shift_ms = config.frame_shift_ms
+        self.dither = config.dither
+        self.compute_lengths = compute_lengths
+        self.use_precomputed_fbank = use_precomputed_fbank
+
+        self.entries: List[Dict[str, Any]] = []
+        self.lengths: List[int] = []
+
+        with self.manifest_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                txt = item.get("txt") or item.get("text")
+                if txt is None:
+                    raise ValueError("清单每行必须包含 'txt'/'text'")
+
+                if use_precomputed_fbank:
+                    feat = item.get("feat")
+                    if feat is None:
+                        raise ValueError("使用预处理 fbank 时，清单每行必须包含 'feat'")
+                    self.entries.append({"feat": feat, "txt": txt})
+
+                    if compute_lengths:
+                        feat_frames = int(item.get("feat_frames", 0) or 0)
+                        self.lengths.append(feat_frames if feat_frames > 0 else 100)
+                else:
+                    wav = item.get("wav")
+                    if wav is None:
+                        raise ValueError("清单每行必须包含 'wav'")
+                    self.entries.append({"wav": wav, "txt": txt})
+
+                    if compute_lengths:
+                        duration_sec = float(item.get("length", 0.0) or 0.0)
+                        if duration_sec > 0:
+                            duration_ms = duration_sec * 1000.0
+                            feat_frames = int((duration_ms - self.frame_length_ms) / self.frame_shift_ms) + 1
+                            self.lengths.append(max(1, feat_frames))
+                        else:
+                            self.lengths.append(100)
+
+        if not self.entries:
+            raise RuntimeError(f"{self.manifest_path} 为空")
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        item = self.entries[idx]
+        text: str = item["txt"]
+
+        if self.use_precomputed_fbank:
+            feat_path = item["feat"]
+            if feat_path.endswith(".npy"):
+                feat = torch.from_numpy(np.load(feat_path))
+            else:
+                feat = torch.load(feat_path, weights_only=False)
+            if feat.dtype != torch.float32:
+                feat = feat.float()
+        else:
+            wav_path = item["wav"]
+            waveform, sr = torchaudio.load(wav_path)
+            if waveform.size(0) > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            if sr != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
+                waveform = resampler(waveform)
+                sr = self.sample_rate
+            waveform = waveform * (1 << 15)
+            feat = kaldi.fbank(
+                waveform,
+                num_mel_bins=self.num_mel_bins,
+                frame_length=self.frame_length_ms,
+                frame_shift=self.frame_shift_ms,
+                dither=self.dither,
+                energy_floor=0.0,
+                sample_frequency=float(sr),
+            )
+        target_ids = torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
+        return feat, target_ids, text
+
+
+def asr_collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, str]]) -> Dict[str, Any]:
+    # ===== [MOD] 过滤空 target（CTC 会炸）=====
+    filtered: List[Tuple[torch.Tensor, torch.Tensor, str]] = []
+    for feat, tgt, txt in batch:
+        if tgt.numel() == 0:
+            continue
+        filtered.append((feat, tgt, txt))
+    if not filtered:
+        # 返回一个占位（上层会跳过）
+        return {"_empty": True}
+
+    feats, targets, texts = zip(*filtered)
+    feat_lengths = torch.tensor([f.size(0) for f in feats], dtype=torch.long)
+    padded_feats = pad_sequence(feats, batch_first=True)  # (B, T, D)
+
+    target_lengths = torch.tensor([t.size(0) for t in targets], dtype=torch.long)
+    concatenated_targets = torch.cat(targets, dim=0)
+
+    return {
+        "feats": padded_feats,
+        "feat_lengths": feat_lengths,
+        "max_feat_lengths": int(feat_lengths.max().item()),
+        "targets": concatenated_targets,
+        "target_lengths": target_lengths,
+        "texts": list(texts),
+    }
+
+
+# ===== [MOD] WeNet 同款 Conv2dSubsampling4（时长 /4），并正确更新长度 =====
+# 参考：WeNet 的 Conv2dSubsampling4 实现与 mask 切片方式 :contentReference[oaicite:6]{index=6}
+class Conv2dSubsampling4(nn.Module):
+    def __init__(self, idim: int, odim: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, odim, kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(odim, odim, kernel_size=3, stride=2),
+            nn.ReLU(),
+        )
+        # freq 维度从 idim -> (((idim-1)//2 -1)//2)（WeNet 的写法）
+        out_freq = (((idim - 1) // 2 - 1) // 2)
+        self.out = nn.Linear(odim * out_freq, odim)
+
+    @staticmethod
+    def _out_len(lens: torch.Tensor) -> torch.Tensor:
+        # conv2d valid padding: out = floor((L-3)/2 + 1) = floor((L-1)/2)
+        l1 = torch.div(lens - 1, 2, rounding_mode="floor")
+        l2 = torch.div(l1 - 1, 2, rounding_mode="floor")
+        return torch.clamp(l2, min=0)
+
+    def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, T, F)
+        x = x.unsqueeze(1)  # (B, 1, T, F)
+        x = self.conv(x)    # (B, C, T', F')
+        b, c, t, f = x.size()
+        x = x.transpose(1, 2).contiguous().view(b, t, c * f)  # (B, T', C*F')
+        x = self.out(x)  # (B, T', C)
+        out_lens = self._out_len(x_lens)
+        return x, out_lens
+
+
+class CTCConformer(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        vocab_size: int,
+        encoder_dim: int,
+        ffn_dim: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        # ===== [MOD] WeNet 风格：Conv2dSubsampling4 把 80 -> encoder_dim，并把 T / 4 =====
+        self.subsampling = Conv2dSubsampling4(idim=input_dim, odim=encoder_dim)
+
+        # ===== [MOD] 正确使用 torchaudio Conformer：input_dim=d_model，ffn_dim=FFN hidden =====
+        self.conformer = torchaudio.models.Conformer(
+            input_dim=encoder_dim,
+            num_layers=num_layers,
+            ffn_dim=ffn_dim,
+            dropout=dropout,
+            depthwise_conv_kernel_size=15,
+            num_heads=num_heads,
+        )
+        self.ctc_linear = nn.Linear(encoder_dim, vocab_size)
+
+    def forward(self, feats: torch.Tensor, feat_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, out_lens = self.subsampling(feats, feat_lengths)     # (B, T', C)
+        x, out_lens2 = self.conformer(x, out_lens)              # (B, T', C)
+        logits = self.ctc_linear(x)                             # (B, T', V)
+        return logits, out_lens2
+
+
+def ctc_greedy_decode_ids(
+    logit_batch: torch.Tensor,
+    lengths: torch.Tensor,
+    blank_id: int,
+) -> List[List[int]]:
+    # 只用于“抽样算 CER”，不要拿它当训练瓶颈
+    with torch.no_grad():
+        pred = torch.argmax(F.log_softmax(logit_batch, dim=-1), dim=-1)  # (B, T)
+    results: List[List[int]] = []
+    bsz = pred.size(0)
+    for b in range(bsz):
+        T = int(lengths[b].item())
+        seq = pred[b, :T].tolist()
+        collapsed: List[int] = []
+        prev = blank_id
+        for idx in seq:
+            if idx != blank_id and idx != prev:
+                collapsed.append(idx)
+            prev = idx
+        results.append(collapsed)
+    return results
+
+
+def char_edit_distance(ref: str, hyp: str) -> int:
+    # 简单 DP：只在抽样 batch 上跑，避免 dev 变“CPU 大赛”
+    ref_chars = list(ref)
+    hyp_chars = list(hyp)
+    n = len(ref_chars)
+    m = len(hyp_chars)
+    if n == 0:
+        return m
+    if m == 0:
+        return n
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        ri = ref_chars[i - 1]
+        for j in range(1, m + 1):
+            cost = 0 if ri == hyp_chars[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost,
+            )
+    return dp[n][m]
+
+
+@torch.no_grad()
+def evaluate_ctc(
+    model: nn.Module,
+    dataloader: DataLoader,
+    tokenizer: CharTokenizer,
+    device: torch.device,
+    ctc_loss_fn: nn.CTCLoss,
+    cmvn: Optional[torch.Tensor],
+    max_batches: Optional[int],
+    cer_max_batches: int,
+) -> Tuple[float, float, Dict[str, float]]:
+    model.eval()
+    total_loss = 0.0
+    total_frames = 0
+
+    # CER 只对前 cer_max_batches 计算
+    total_edit = 0
+    total_chars = 0
+
+    blank_cnt = 0
+    frame_cnt = 0
+    hyp_len_sum = 0
+    hyp_cnt = 0
+
+    invalid_cnt = 0
+    seen_cnt = 0
+
+    for bi, batch in enumerate(tqdm(dataloader, ncols=100, desc="dev", leave=False)):
+        if batch.get("_empty", False):
+            continue
+        if max_batches is not None and bi >= max_batches:
+            break
+
+        feats = batch["feats"].to(device, non_blocking=True)
+        feat_lengths = batch["feat_lengths"].to(device, non_blocking=True)
+        targets = batch["targets"].to(device, non_blocking=True)
+        target_lengths = batch["target_lengths"].to(device, non_blocking=True)
+        texts = batch["texts"]
+
+        if cmvn is not None:
+            feats = (feats - cmvn[0]) / cmvn[1]
+
+        logits, out_lens = model(feats, feat_lengths)  # (B, T', V), (B,)
+        log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)  # (T', B, V)
+
+        # invalid 样本统计：T' < U 时 CTCLoss 可能 inf，zero_infinity 会吞掉梯度 :contentReference[oaicite:7]{index=7}
+        invalid = (out_lens < target_lengths).sum().item()
+        invalid_cnt += int(invalid)
+        seen_cnt += int(out_lens.numel())
+
+        loss = ctc_loss_fn(log_probs, targets, out_lens, target_lengths)
+        # ===== [MOD] reduction='sum'，再除以 batch（贴 WeNet CTC 写法）:contentReference[oaicite:8]{index=8} =====
+        loss = loss / max(1, feats.size(0))
+
+        batch_frames = int(out_lens.sum().item())
+        total_loss += float(loss.item()) * batch_frames
+        total_frames += batch_frames
+
+        # debug：blank 比例 & 平均 hyp 长度（用 greedy 的 argmax 统计）
+        pred = torch.argmax(logits, dim=-1)  # (B, T')
+        blank_cnt += int((pred == tokenizer.blank_id).sum().item())
+        frame_cnt += int(pred.numel())
+
+        if bi < cer_max_batches:
+            pred_id_seqs = ctc_greedy_decode_ids(logits, out_lens, tokenizer.blank_id)
+            for ref_text, pred_ids in zip(texts, pred_id_seqs):
+                hyp_text = tokenizer.decode_ids(pred_ids)
+                ref = "".join(ch for ch in ref_text if not ch.isspace())
+                total_edit += char_edit_distance(ref, hyp_text)
+                total_chars += len(ref)
+                hyp_len_sum += len(hyp_text)
+                hyp_cnt += 1
+
+    cer = (total_edit / total_chars) if total_chars > 0 else 0.0
+    loss_per_frame = (total_loss / total_frames) if total_frames > 0 else 0.0
+    debug = {
+        "blank_frac": (blank_cnt / frame_cnt) if frame_cnt > 0 else 0.0,
+        "avg_hyp_len": (hyp_len_sum / hyp_cnt) if hyp_cnt > 0 else 0.0,
+        "invalid_ratio": (invalid_cnt / seen_cnt) if seen_cnt > 0 else 0.0,
+    }
+    return cer, loss_per_frame, debug
+
+
+# ===== [MOD] WeNet/Transformer 常用 WarmupLR（step 级调度，别用 Plateau 看心情）=====
+class WarmupLR:
+    def __init__(self, optimizer: torch.optim.Optimizer, warmup_steps: int):
+        self.optimizer = optimizer
+        self.warmup_steps = max(1, int(warmup_steps))
+        self.step_num = 0
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+
+    def step(self) -> float:
+        self.step_num += 1
+        s = float(self.step_num)
+        w = float(self.warmup_steps)
+        scale = (w ** 0.5) * min(s ** -0.5, s * (w ** -1.5))
+        for lr0, group in zip(self.base_lrs, self.optimizer.param_groups):
+            group["lr"] = lr0 * scale
+        return self.optimizer.param_groups[0]["lr"]
+
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    lr_sched: WarmupLR,
+    ctc_loss_fn: nn.CTCLoss,
+    device: torch.device,
+    max_grad_norm: float,
+    tokenizer: CharTokenizer,
+    cmvn: Optional[torch.Tensor],
+    specaug: Optional[SpecAugment],
+    specaug_prob: float,
+    cer_log_interval: int,
+) -> float:
+    model.train()
+    total_loss = 0.0
+    total_frames = 0
+
+    total_edit = 0
+    total_chars = 0
+
+    invalid_cnt = 0
+    seen_cnt = 0
+
+    for step, batch in enumerate(tqdm(dataloader, ncols=100, desc="train", leave=False)):
+        if batch.get("_empty", False):
+            continue
+        feats = batch["feats"].to(device, non_blocking=True)
+        feat_lengths = batch["feat_lengths"].to(device, non_blocking=True)
+        targets = batch["targets"].to(device, non_blocking=True)
+        target_lengths = batch["target_lengths"].to(device, non_blocking=True)
+
+        if cmvn is not None:
+            feats = (feats - cmvn[0]) / cmvn[1]
+        if specaug is not None and random.random() < specaug_prob:
+            feats = specaug(feats)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, out_lens = model(feats, feat_lengths)  # (B, T', V), (B,)
+            log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)
+
+        invalid = (out_lens < target_lengths).sum().item()
+        invalid_cnt += int(invalid)
+        seen_cnt += int(out_lens.numel())
+
+        loss = ctc_loss_fn(log_probs, targets, out_lens, target_lengths)
+        loss = loss / max(1, feats.size(0))  # [MOD] 同 evaluate
+
+        loss.backward()
+        if max_grad_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        lr_sched.step()
+
+        batch_frames = int(out_lens.sum().item())
+        total_loss += float(loss.item()) * batch_frames
+        total_frames += batch_frames
+
+        # ===== [MOD] 训练 CER 只抽样算，别每步 CPU DP =====
+        if cer_log_interval > 0 and (step % cer_log_interval == 0):
+            with torch.no_grad():
+                pred_id_seqs = ctc_greedy_decode_ids(logits, out_lens, tokenizer.blank_id)
+                # 这里只用当前 batch 的 targets 做个粗估
+                offset = 0
+                for b, pred_ids in enumerate(pred_id_seqs):
+                    cur_len = int(target_lengths[b].item())
+                    tgt_ids = targets[offset:offset + cur_len].tolist()
+                    offset += cur_len
+                    ref_text = tokenizer.decode_ids(tgt_ids)
+                    hyp_text = tokenizer.decode_ids(pred_ids)
+                    total_edit += char_edit_distance(ref_text, hyp_text)
+                    total_chars += len(ref_text)
+
+    train_loss = (total_loss / total_frames) if total_frames > 0 else 0.0
+    train_cer = (total_edit / total_chars) if total_chars > 0 else 0.0
+    inv_ratio = (invalid_cnt / seen_cnt) if seen_cnt > 0 else 0.0
+    print(f"train_loss: {train_loss:.3f} train_cer(sampled): {train_cer:.3f} invalid_ratio: {inv_ratio:.2%}")
+    return train_loss
+
+
+def dynamic_pre_compile(
+        train_loader: DataLoader,
+        device: torch.device,
+        model: nn.Module,
+        max_T: int,
+        min_T: int,  # [MOD] 新增：最小动态长度
+) -> nn.Module:
+    warmup_batch = next(iter(train_loader))
+    if warmup_batch.get("_empty", False):
+        return model
+
+    warmup_feats = warmup_batch["feats"].to(device)  # (B, T, D)
+    warmup_feat_lengths = warmup_batch["feat_lengths"].to(device)
+
+    # [MOD] Conv2dSubsampling4(k=3,s=2) 在很短的 T 上会触发 shape guard；
+    #      你之前 min=1 让编译器要求 [1,max_T] 全区间都合法，于是炸。
+    #      把 min 收紧到 >=11（或更大）即可。
+    safe_min_T = int(max(11, min_T))
+    safe_max_T = int(max(safe_min_T, max_T))
+
+    torch._dynamo.mark_dynamic(warmup_feats, 1, min=safe_min_T, max=safe_max_T)
+
+    # [MOD] 编译失败就直接回退到 eager，不要卡死训练
+    try:
+        model = torch.compile(model)
+        with torch.no_grad():
+            _ = model(warmup_feats, warmup_feat_lengths)
+        print(f"[compile] ok: dynamic T in [{safe_min_T}, {safe_max_T}]")
+        return model
+    except torch.fx.experimental.symbolic_shapes.ConstraintViolationError as e:
+        print(f"[compile] ConstraintViolationError, fallback to eager. err={e}")
+        return model
+
+
+def main() -> None:
+    run_dir = Path("logs") / time.strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_f = open(run_dir / "stdout.log", "w", encoding="utf-8", buffering=1)
+
+    # ===== [MOD] 更稳的 stdout tee：关闭后别再 flush =====
+    class _Tee:
+        def __init__(self, *fs):
+            self.fs = list(fs)
+
+        def write(self, s: str):
+            for f in self.fs:
+                try:
+                    if hasattr(f, "closed") and f.closed:
+                        continue
+                    f.write(s)
+                    f.flush()
+                except Exception:
+                    pass
+
+        def flush(self):
+            for f in self.fs:
+                try:
+                    if hasattr(f, "closed") and f.closed:
+                        continue
+                    f.flush()
+                except Exception:
+                    pass
+
+    try:
+        src = Path(__file__).read_text(encoding="utf-8")
+    except Exception as e:
+        src = f"<FAILED TO READ __file__: {e}>"
+    print("===== SCRIPT SNAPSHOT BEGIN =====", file=log_f)
+    print(src, file=log_f)
+    print("===== SCRIPT SNAPSHOT END =====", file=log_f)
+    log_f.flush()
+
+    sys.stdout = _Tee(sys.__stdout__, log_f)
+
+    def _close_log():
+        try:
+            log_f.close()
+        except Exception:
+            pass
+
+    atexit.register(_close_log)
+    print(f"[log] run_dir={run_dir.resolve()}")
+
+    torch.set_float32_matmul_precision("high")
+
+    config = ASRConfig(
+        train_manifest="dataset/train_fbank_relpath.jsonl",
+        dev_manifest="dataset/dev_fbank_relpath.jsonl",
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("使用设备:", device)
+
+    cmvn_path = Path(config.cmvn_path)
+    if cmvn_path.exists():
+        cmvn = torch.from_numpy(np.load(cmvn_path)).to(device)
+        print(f"已加载 CMVN: {cmvn_path}")
+    else:
+        cmvn = None
+        print(f"警告: CMVN 文件不存在 ({cmvn_path})，跳过归一化")
+
+    print("构建字级词表...")
+    tokenizer = CharTokenizer.build_from_jsonl(config.train_manifest)
+    print("vocab_size (含 blank):", tokenizer.vocab_size)
+
+    print("构建数据集...")
+    train_dataset = JsonlASRDataset(config.train_manifest, tokenizer, config, compute_lengths=True, use_precomputed_fbank=True)
+    dev_dataset = JsonlASRDataset(config.dev_manifest, tokenizer, config, compute_lengths=True, use_precomputed_fbank=True)
+
+    print("创建动态 batch 采样器...")
+    train_sampler = LengthBucketBatchSampler(
+        lengths=train_dataset.lengths,
+        batch_size=config.batch_size,
+        max_frames_per_batch=config.max_frames_per_batch,
+        shuffle=config.shuffle,
+        bucket_size=config.bucket_size,
+    )
+    dev_sampler = LengthBucketBatchSampler(
+        lengths=dev_dataset.lengths,
+        batch_size=config.batch_size,
+        max_frames_per_batch=config.max_frames_per_batch,
+        shuffle=False,
+        bucket_size=config.bucket_size,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        collate_fn=asr_collate_fn,
+        prefetch_factor=config.prefetch_factor,
+        persistent_workers=(config.persistent_workers and config.num_workers > 0),
+    )
+    dev_loader = DataLoader(
+        dev_dataset,
+        batch_sampler=dev_sampler,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        collate_fn=asr_collate_fn,
+        prefetch_factor=config.prefetch_factor,
+        persistent_workers=(config.persistent_workers and config.num_workers > 0),
+    )
+
+    # ===== [MOD] SpecAugment 放到 main 里实例化（避免全局）=====
+    specaug = SpecAugment(
+        freq_mask_param=10,
+        num_freq_masks=2,
+        time_mask_param=50,
+        num_time_masks=2,
+        protect_last=False,
+    )
+
+    model = CTCConformer(
+        input_dim=config.num_mel_bins,
+        vocab_size=tokenizer.vocab_size,
+        encoder_dim=config.encoder_dim,
+        ffn_dim=config.ffn_dim,
+        num_layers=config.layers,
+        num_heads=config.num_heads,
+        dropout=config.dropout,
+    ).to(device)
+
+    # ===== [MOD] CTC loss：sum + /B（贴近 WeNet CTC 模块）:contentReference[oaicite:9]{index=9} =====
+    ctc_loss_fn = nn.CTCLoss(
+        blank=tokenizer.blank_id,
+        reduction="sum",
+        zero_infinity=True,  # inputs too short 时 inf 会被置零 :contentReference[oaicite:10]{index=10}
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+        fused=True,
+    )
+    lr_sched = WarmupLR(optimizer, warmup_steps=config.warmup_steps)
+
+    best_cer = 1.0
+    Path("saved_models").mkdir(parents=True, exist_ok=True)
+    best_path = Path(f"saved_models/best_ctc_asr_cer_{time.strftime('%Y%m%d-%H%M%S')}.pt")
+
+    max_T = max(train_dataset.lengths) if train_dataset.lengths else 2048
+    min_T = min(train_dataset.lengths) if train_dataset.lengths else 11  # [MOD]
+    model = dynamic_pre_compile(train_loader, device, model, max_T=max_T, min_T=min_T)  # [MOD]
+
+
+    with sdpa_kernel(SDPBackend.MATH):
+        for epoch in range(1, config.num_epochs + 1):
+            train_one_epoch(
+                model=model,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                lr_sched=lr_sched,
+                ctc_loss_fn=ctc_loss_fn,
+                device=device,
+                max_grad_norm=config.max_grad_norm,
+                tokenizer=tokenizer,
+                cmvn=cmvn,
+                specaug=specaug,
+                specaug_prob=config.use_specaug_prob,
+                cer_log_interval=config.train_cer_log_interval,
+            )
+
+            cer, dev_loss, dbg = evaluate_ctc(
+                model=model,
+                dataloader=dev_loader,
+                tokenizer=tokenizer,
+                device=device,
+                ctc_loss_fn=ctc_loss_fn,
+                cmvn=cmvn,
+                max_batches=config.eval_max_batches,
+                cer_max_batches=config.eval_cer_max_batches,
+            )
+            print(
+                f"[Epoch {epoch:02d}] dev_loss_per_frame={dev_loss:.4f}, "
+                f"dev_CER(sampled)={cer * 100:.2f}% "
+                f"[blank_frac={dbg['blank_frac']*100:.2f}%, avg_hyp_len={dbg['avg_hyp_len']:.2f}, invalid_ratio={dbg['invalid_ratio']*100:.2f}%]"
+            )
+
+            if cer < best_cer:
+                best_cer = cer
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "config": config.__dict__,
+                        "char2id": tokenizer.char2id,
+                        "blank_id": tokenizer.blank_id,
+                    },
+                    best_path,
+                )
+                print(f"  CER 改善，已保存到 {best_path} (best_CER={best_cer * 100:.2f}%)")
+
+            if device.type == "cuda":
+                alloc = torch.cuda.memory_allocated() / 1024**2
+                resv = torch.cuda.memory_reserved() / 1024**2
+                print(f"allocated={alloc:.1f}MB reserved={resv:.1f}MB lr={optimizer.param_groups[0]['lr']:.3e}")
+
+
+if __name__ == "__main__":
+    main()
+
+===== SCRIPT SNAPSHOT END =====
+[log] run_dir=/home/lhc/data/gudsen/asr/logs/20251228-161204
+使用设备: cuda
+已加载 CMVN: dataset/cmvn.npy
+构建字级词表...
+vocab_size (含 blank): 4231
+构建数据集...
+创建动态 batch 采样器...
+[compile] ConstraintViolationError, fallback to eager. err=Constraints violated (L['feats'].size()[1])! For more information, run with TORCH_LOGS="+dynamic".
+  - Not all values of L['feats'].size()[1] = L['feats'].size()[1] in the specified range 121 <= L['feats'].size()[1] <= 1451 satisfy the generated guard (27 % (27*(((-3) + L['feats'].size()[1]) // 4))) != 0.
+
+train_loss: 65.663 train_cer(sampled): 0.884 invalid_ratio: 0.00%
+[Epoch 01] dev_loss_per_frame=26.1059, dev_CER(sampled)=49.76% [blank_frac=89.69%, avg_hyp_len=13.66, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=49.76%)
+allocated=542.8MB reserved=10934.0MB lr=2.835e-04
+train_loss: 20.797 train_cer(sampled): 0.325 invalid_ratio: 0.00%
+[Epoch 02] dev_loss_per_frame=15.6301, dev_CER(sampled)=31.83% [blank_frac=89.35%, avg_hyp_len=14.40, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=31.83%)
+allocated=548.6MB reserved=10934.0MB lr=4.695e-04
+train_loss: 13.109 train_cer(sampled): 0.207 invalid_ratio: 0.00%
+[Epoch 03] dev_loss_per_frame=9.8319, dev_CER(sampled)=20.87% [blank_frac=89.22%, avg_hyp_len=13.94, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=20.87%)
+allocated=544.3MB reserved=10934.0MB lr=3.833e-04
+train_loss: 9.408 train_cer(sampled): 0.166 invalid_ratio: 0.00%
+[Epoch 04] dev_loss_per_frame=8.0418, dev_CER(sampled)=17.56% [blank_frac=89.15%, avg_hyp_len=14.03, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=17.56%)
+allocated=544.4MB reserved=10934.0MB lr=3.320e-04
+train_loss: 7.336 train_cer(sampled): 0.135 invalid_ratio: 0.00%
+[Epoch 05] dev_loss_per_frame=7.0662, dev_CER(sampled)=16.17% [blank_frac=89.38%, avg_hyp_len=14.03, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=16.17%)
+allocated=550.8MB reserved=10934.0MB lr=2.969e-04
+train_loss: 5.902 train_cer(sampled): 0.116 invalid_ratio: 0.00%
+[Epoch 06] dev_loss_per_frame=6.7622, dev_CER(sampled)=15.36% [blank_frac=88.91%, avg_hyp_len=14.04, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=15.36%)
+allocated=540.2MB reserved=10934.0MB lr=2.711e-04
+train_loss: 4.951 train_cer(sampled): 0.088 invalid_ratio: 0.00%
+[Epoch 07] dev_loss_per_frame=6.0956, dev_CER(sampled)=14.41% [blank_frac=88.95%, avg_hyp_len=14.06, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=14.41%)
+allocated=536.1MB reserved=10934.0MB lr=2.510e-04
+train_loss: 4.381 train_cer(sampled): 0.075 invalid_ratio: 0.00%
+[Epoch 08] dev_loss_per_frame=6.1874, dev_CER(sampled)=14.17% [blank_frac=89.34%, avg_hyp_len=14.08, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=14.17%)
+allocated=537.0MB reserved=10934.0MB lr=2.347e-04
+train_loss: 3.808 train_cer(sampled): 0.066 invalid_ratio: 0.00%
+[Epoch 09] dev_loss_per_frame=5.9466, dev_CER(sampled)=13.19% [blank_frac=89.24%, avg_hyp_len=14.03, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=13.19%)
+allocated=541.7MB reserved=10934.0MB lr=2.213e-04
+train_loss: 3.306 train_cer(sampled): 0.058 invalid_ratio: 0.00%
+[Epoch 10] dev_loss_per_frame=5.8500, dev_CER(sampled)=12.63% [blank_frac=89.45%, avg_hyp_len=14.07, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=12.63%)
+allocated=543.1MB reserved=10934.0MB lr=2.100e-04
+train_loss: 2.900 train_cer(sampled): 0.056 invalid_ratio: 0.00%
+[Epoch 11] dev_loss_per_frame=5.8500, dev_CER(sampled)=12.66% [blank_frac=89.27%, avg_hyp_len=14.05, invalid_ratio=0.00%]
+allocated=542.1MB reserved=10934.0MB lr=2.002e-04
+train_loss: 2.646 train_cer(sampled): 0.048 invalid_ratio: 0.00%
+[Epoch 12] dev_loss_per_frame=5.7893, dev_CER(sampled)=12.42% [blank_frac=89.39%, avg_hyp_len=14.06, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=12.42%)
+allocated=552.1MB reserved=10934.0MB lr=1.917e-04
+train_loss: 2.409 train_cer(sampled): 0.049 invalid_ratio: 0.00%
+[Epoch 13] dev_loss_per_frame=5.9105, dev_CER(sampled)=12.89% [blank_frac=89.38%, avg_hyp_len=14.08, invalid_ratio=0.00%]
+allocated=541.1MB reserved=10934.0MB lr=1.842e-04
+train_loss: 2.184 train_cer(sampled): 0.036 invalid_ratio: 0.00%
+[Epoch 14] dev_loss_per_frame=5.9338, dev_CER(sampled)=11.84% [blank_frac=89.43%, avg_hyp_len=14.06, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=11.84%)
+allocated=535.5MB reserved=10934.0MB lr=1.775e-04
+train_loss: 1.957 train_cer(sampled): 0.033 invalid_ratio: 0.00%
+[Epoch 15] dev_loss_per_frame=5.9947, dev_CER(sampled)=12.52% [blank_frac=89.40%, avg_hyp_len=14.10, invalid_ratio=0.00%]
+allocated=541.2MB reserved=10934.0MB lr=1.714e-04
+train_loss: 1.844 train_cer(sampled): 0.032 invalid_ratio: 0.00%
+[Epoch 16] dev_loss_per_frame=6.2559, dev_CER(sampled)=12.23% [blank_frac=89.37%, avg_hyp_len=14.08, invalid_ratio=0.00%]
+allocated=545.3MB reserved=10934.0MB lr=1.660e-04
+train_loss: 1.786 train_cer(sampled): 0.031 invalid_ratio: 0.00%
+[Epoch 17] dev_loss_per_frame=6.1547, dev_CER(sampled)=11.43% [blank_frac=89.36%, avg_hyp_len=14.09, invalid_ratio=0.00%]
+  CER 改善，已保存到 saved_models/best_ctc_asr_cer_20251228-161206.pt (best_CER=11.43%)
+allocated=539.3MB reserved=10934.0MB lr=1.610e-04
+train_loss: 1.642 train_cer(sampled): 0.032 invalid_ratio: 0.00%
+[Epoch 18] dev_loss_per_frame=6.3244, dev_CER(sampled)=12.41% [blank_frac=89.38%, avg_hyp_len=14.07, invalid_ratio=0.00%]
+allocated=542.9MB reserved=10934.0MB lr=1.565e-04
+train_loss: 1.493 train_cer(sampled): 0.028 invalid_ratio: 0.00%
+[Epoch 19] dev_loss_per_frame=6.3606, dev_CER(sampled)=12.04% [blank_frac=89.35%, avg_hyp_len=14.07, invalid_ratio=0.00%]
+allocated=543.2MB reserved=10934.0MB lr=1.523e-04
