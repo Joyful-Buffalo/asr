@@ -118,6 +118,82 @@ class _FeedForwardModule(torch.nn.Module):
         return self.sequential(input)
 
 
+class _MultiheadAttentionWithRope(torch.nn.Module):
+    def __init__(self, input_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        if input_dim % num_heads != 0:
+            raise ValueError("input_dim must be divisible by num_heads.")
+        self.num_heads = num_heads
+        self.head_dim = input_dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even to apply RoPE.")
+        self.qkv_proj = torch.nn.Linear(input_dim, input_dim * 3)
+        self.out_proj = torch.nn.Linear(input_dim, input_dim)
+        self.dropout = dropout
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._rope_seq_len = 0
+        self._rope_cos = torch.empty(0)
+        self._rope_sin = torch.empty(0)
+        self._rope_cache_dtype: Optional[torch.dtype] = None
+        self._rope_cache_device: Optional[torch.device] = None
+
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _update_rope_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        if (
+            self._rope_seq_len >= seq_len
+            and self._rope_cache_device == device
+            and self._rope_cache_dtype == dtype
+        ):
+            return
+        positions = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(positions, self.inv_freq.to(device=device))
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = torch.cos(emb).to(dtype=dtype)
+        sin = torch.sin(emb).to(dtype=dtype)
+        self._rope_cos = cos[None, None, :, :]
+        self._rope_sin = sin[None, None, :, :]
+        self._rope_seq_len = seq_len
+        self._rope_cache_device = device
+        self._rope_cache_dtype = dtype
+
+    def _apply_rope(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(2)
+        self._update_rope_cache(seq_len, x.device, x.dtype)
+        cos = self._rope_cos[:, :, :seq_len, :]
+        sin = self._rope_sin[:, :, :seq_len, :]
+        return (x * cos) + (self._rotate_half(x) * sin)
+
+    def forward(
+        self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        x = x.transpose(0, 1)
+        bsz, seq_len, dim = x.shape
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self._apply_rope(q)
+        k = self._apply_rope(k)
+        attn_mask = None
+        if key_padding_mask is not None:
+            attn_mask = key_padding_mask[:, None, None, :]
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attn = attn.transpose(1, 2).contiguous().view(bsz, seq_len, dim)
+        attn = self.out_proj(attn)
+        return attn.transpose(0, 1)
+
+
 class ConformerLayer(torch.nn.Module):
     r"""Conformer layer that constitutes Conformer.
 
@@ -142,13 +218,18 @@ class ConformerLayer(torch.nn.Module):
         dropout: float = 0.0,
         use_group_norm: bool = False,
         convolution_first: bool = False,
+        use_rope: bool = False,
     ) -> None:
         super().__init__()
 
         self.ffn1 = _FeedForwardModule(input_dim, ffn_dim, dropout=dropout)
 
         self.self_attn_layer_norm = torch.nn.LayerNorm(input_dim)
-        self.self_attn = torch.nn.MultiheadAttention(input_dim, num_attention_heads, dropout=dropout)
+        self.self_attn = (
+            _MultiheadAttentionWithRope(input_dim, num_attention_heads, dropout=dropout)
+            if use_rope
+            else torch.nn.MultiheadAttention(input_dim, num_attention_heads, dropout=dropout)
+        )
         self.self_attn_dropout = torch.nn.Dropout(dropout)
 
         self.conv_module = _ConvolutionModule(
@@ -172,10 +253,6 @@ class ConformerLayer(torch.nn.Module):
         input = residual + input
         return input
     
-    def apply_rope(self,x, position_idx):
-        seq_len = position_idx.size(1)
-        # inv_freq = 1. / (10000 ** (torch.arange(0, self.head_dim, 2).float()/))
-
     def forward(self, input: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
         r"""
         Args:
@@ -194,13 +271,16 @@ class ConformerLayer(torch.nn.Module):
 
         residual = x
         x = self.self_attn_layer_norm(x)
-        x, _ = self.self_attn(
-            query=x,
-            key=x,
-            value=x,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
+        if isinstance(self.self_attn, torch.nn.MultiheadAttention):
+            x, _ = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+        else:
+            x = self.self_attn(x, key_padding_mask)
         x = self.self_attn_dropout(x)
         x = x + residual
 
@@ -243,6 +323,7 @@ class Conformer(torch.nn.Module):
         dropout: float = 0.0,
         use_group_norm: bool = False,
         convolution_first: bool = False,
+        use_rope: bool = False,
     ):
         super().__init__()
 
@@ -256,6 +337,7 @@ class Conformer(torch.nn.Module):
                     dropout=dropout,
                     use_group_norm=use_group_norm,
                     convolution_first=convolution_first,
+                    use_rope=use_rope,
                 )
                 for _ in range(num_layers)
             ]
