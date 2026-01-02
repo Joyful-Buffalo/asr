@@ -78,7 +78,7 @@ class ASRConfig:
 
     # ===== [MOD-SCHED] 速度扰动随 epoch 递增：从 speed_prob_start 线性爬到 use_speed_perturb_prob =====
     speed_prob_start: float = 0.0
-    speed_prob_ramp_epochs: int = 20
+    speed_prob_ramp_epochs: int = 10
 
 
 # ===== [MOD-SCHED] 跨 DataLoader worker 共享的 float（用于动态调 speed_prob）=====
@@ -398,8 +398,11 @@ class Conv2dSubsampling4(nn.Module):
         x = x.unsqueeze(1)  # (B, 1, T, F)
         x = self.conv(x)    # (B, C, T', F')
         b, c, t, f = x.size()
-        x = x.transpose(1, 2).contiguous().view(b, t, c * f)  # (B, T', C*F')
+        # x = x.transpose(1, 2).contiguous().view(b, t, c * f)  # (B, T', C*F')
+        x = x.permute(0, 2, 1, 3).contiguous()
+        x = x.flatten(2)
         x = self.out(x)  # (B, T', C)
+
         out_lens = self._out_len(x_lens)
         return x, out_lens
 
@@ -418,14 +421,14 @@ class CTCConformer(nn.Module):
     ) -> None:
         super().__init__()
         self.subsampling = Conv2dSubsampling4(idim=input_dim, odim=encoder_dim)
-        self.conformer = Conformer(
+        self.conformer = torchaudio.models.Conformer(
             input_dim=encoder_dim,
             num_layers=num_layers,
             ffn_dim=ffn_dim,
             dropout=dropout,
             depthwise_conv_kernel_size=15,
             num_heads=num_heads,
-            use_rope=use_rope,
+            # use_rope=use_rope,
         )
         self.ctc_linear = nn.Linear(encoder_dim, vocab_size)
 
@@ -663,13 +666,7 @@ def train_one_epoch(
     return train_loss
 
 
-def dynamic_pre_compile(
-        train_loader: DataLoader,
-        device: torch.device,
-        model: nn.Module,
-        max_T: int,
-        min_T: int,
-) -> nn.Module:
+def dynamic_pre_compile(train_loader: DataLoader, device: torch.device, model: nn.Module) -> nn.Module:
     warmup_batch = next(iter(train_loader))
     if warmup_batch.get("_empty", False):
         return model
@@ -677,20 +674,23 @@ def dynamic_pre_compile(
     warmup_feats = warmup_batch["feats"].to(device)
     warmup_feat_lengths = warmup_batch["feat_lengths"].to(device)
 
-    safe_min_T = int(max(11, min_T))
-    safe_max_T = int(max(safe_min_T, max_T))
-
-    torch._dynamo.mark_dynamic(warmup_feats, 1, min=safe_min_T, max=safe_max_T)
+    # ===== [MOD] 不要 mark_dynamic(min/max)，会触发 brittle 的 modulo guard/ConstraintViolationError
+    # 官方建议遇到误导性的 constraint violation 用 maybe_mark_dynamic :contentReference[oaicite:5]{index=5}
+    torch._dynamo.maybe_mark_dynamic(warmup_feats, 0)  # B
+    torch._dynamo.maybe_mark_dynamic(warmup_feats, 1)  # T
 
     try:
-        model = torch.compile(model)
+        # ===== [MOD] dynamic=True：尽量生成动态 kernel，减少反复 recompilation :contentReference[oaicite:6]{index=6}
+        model = torch.compile(model, dynamic=True)
         with torch.no_grad():
             _ = model(warmup_feats, warmup_feat_lengths)
-        print(f"[compile] ok: dynamic T in [{safe_min_T}, {safe_max_T}]")
+        print("[compile] ok (dynamic=True, maybe_mark_dynamic)")
         return model
-    except torch.fx.experimental.symbolic_shapes.ConstraintViolationError as e:
-        print(f"[compile] ConstraintViolationError, fallback to eager. err={e}")
+    except Exception as e:
+        # 这里仍然保底不崩：但正常情况下，上面两处改完就不该再 ConstraintViolationError
+        print(f"[compile] failed, fallback eager. err={e}")
         return model
+
 
 
 def main() -> None:
@@ -855,8 +855,9 @@ def main() -> None:
 
     max_T = max(train_dataset.lengths) if train_dataset.lengths else 2048
     min_T = min(train_dataset.lengths) if train_dataset.lengths else 11
-    model = dynamic_pre_compile(train_loader, device, model, max_T=max_T, min_T=min_T)
-
+    model = dynamic_pre_compile(train_loader, device, model
+                                # , max_T=max_T, min_T=min_T
+                                )
     with sdpa_kernel(SDPBackend.MATH):
         for epoch in range(1, config.num_epochs + 1):
             # ===== [MOD-SCHED] 每个 epoch 更新 speed_prob（线性爬到 use_speed_perturb_prob）=====
@@ -868,7 +869,7 @@ def main() -> None:
             )
             speed_prob_ctrl.set(cur_speed_prob)
 
-            cur_specaug_prob = min(config.use_specaug_prob + epoch * 0.02, 0.5)
+            cur_specaug_prob = min(config.use_specaug_prob + epoch * 0.04, 0.5)
             print(f"[epoch {epoch:02d}] specaug_prob={cur_specaug_prob:.3f} speed_prob={cur_speed_prob:.3f}")
 
             train_one_epoch(
