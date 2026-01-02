@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from torchaudio.compliance import kaldi
 from tqdm import tqdm
 
+from models.conformer import Conformer
 from utils.specAug import SpecAugment
 
 
@@ -47,6 +48,7 @@ class ASRConfig:
     num_heads: int = 4
     layers: int = 12
     dropout: float = 0.1
+    use_rope: bool = False
 
     batch_size: Optional[int] = None
     max_frames_per_batch: Optional[int] = 8192
@@ -412,16 +414,18 @@ class CTCConformer(nn.Module):
         num_layers: int,
         num_heads: int,
         dropout: float,
+        use_rope: bool = False,
     ) -> None:
         super().__init__()
         self.subsampling = Conv2dSubsampling4(idim=input_dim, odim=encoder_dim)
-        self.conformer = torchaudio.models.Conformer(
+        self.conformer = Conformer(
             input_dim=encoder_dim,
             num_layers=num_layers,
             ffn_dim=ffn_dim,
             dropout=dropout,
             depthwise_conv_kernel_size=15,
             num_heads=num_heads,
+            use_rope=use_rope,
         )
         self.ctc_linear = nn.Linear(encoder_dim, vocab_size)
 
@@ -826,6 +830,7 @@ def main() -> None:
         num_layers=config.layers,
         num_heads=config.num_heads,
         dropout=config.dropout,
+        use_rope=config.use_rope,
     ).to(device)
 
     ctc_loss_fn = nn.CTCLoss(
