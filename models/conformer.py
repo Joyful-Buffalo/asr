@@ -6,7 +6,7 @@ import torch
 __all__ = ["Conformer"]
 
 
-def _lengths_to_padding_mask(lengths: torch.Tensor,max_length) -> torch.Tensor:
+def _lengths_to_padding_mask(lengths: torch.Tensor, max_length) -> torch.Tensor:
     batch_size = lengths.shape[0]
     padding_mask = torch.arange(max_length, device=lengths.device, dtype=lengths.dtype).expand(
         batch_size, max_length
@@ -130,6 +130,13 @@ class _MultiheadAttentionWithRope(torch.nn.Module):
         self.qkv_proj = torch.nn.Linear(input_dim, input_dim * 3)
         self.out_proj = torch.nn.Linear(input_dim, input_dim)
         self.dropout = dropout
+
+        # ===== [MOD] 与 torch.nn.MultiheadAttention 更接近的初始化（减少“加了RoPE=换了注意力实现”带来的干扰）
+        torch.nn.init.xavier_uniform_(self.qkv_proj.weight)
+        torch.nn.init.constant_(self.qkv_proj.bias, 0.0)
+        torch.nn.init.xavier_uniform_(self.out_proj.weight)
+        torch.nn.init.constant_(self.out_proj.bias, 0.0)
+
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._rope_seq_len = 0
@@ -179,9 +186,14 @@ class _MultiheadAttentionWithRope(torch.nn.Module):
         v = v.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         q = self._apply_rope(q)
         k = self._apply_rope(k)
+
         attn_mask = None
         if key_padding_mask is not None:
-            attn_mask = key_padding_mask[:, None, None, :]
+            # ===== [MOD] 重要：MultiheadAttention 的 key_padding_mask 语义是 True=忽略(pad)
+            # 但 F.scaled_dot_product_attention 的 bool attn_mask 语义是 True=允许参与注意力
+            # 因此这里必须取反，否则会“只让模型看 padding”。见 PyTorch 官方文档说明。
+            attn_mask = (~key_padding_mask)[:, None, None, :]
+
         attn = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -252,7 +264,7 @@ class ConformerLayer(torch.nn.Module):
         input = input.transpose(0, 1)
         input = residual + input
         return input
-    
+
     def forward(self, input: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
         r"""
         Args:
